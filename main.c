@@ -5,6 +5,11 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <string.h>
+#include <sys/ioctl.h>
+
+#define UNIT 2662
+#define BLOCK_SIZE 640
+#define PORTION 13*1024
 
 struct arguments{
 	float rate;
@@ -12,12 +17,13 @@ struct arguments{
 	unsigned int port;
 };
 
-
 void read_input(int argc, char* argv[],struct arguments* args);
 float parse_rate(void);
 void parse_location(char* location, struct arguments* args);
 
-void create_warehouse();
+void create_warehouse(struct arguments* args);
+void worker(int write_descriptor, struct arguments* args);
+void connector(int read_descriptor, struct arguments* args);
 
 int main(int argc, char* argv[])
 {
@@ -26,28 +32,84 @@ int main(int argc, char* argv[])
 	printf("rate: %f\n",args.rate);
 	printf("address: %s\n",args.address);
 	printf("port: %u\n",args.port);
-
-	create_warehouse();
-
+	create_warehouse(&args);
 	return 0;
 }
 
 
-void create_warehouse()
+void create_warehouse(struct arguments* args)
 {
-
+	int pipe_descriptors[2]; //0 - READ, 1 - WRITE
+	if(pipe(pipe_descriptors) == -1)
+	{
+		perror("Pipe creation failure\n");
+		exit(EXIT_FAILURE);
+	}
 	pid_t p = fork();
 	switch (p) {
 		case -1:
-			perror("");
+			perror("fork failure");
 			exit(2);
 		case 0:
-			printf("Hello from child\n");
+			if(close(pipe_descriptors[0]) == -1)
+			{
+				perror("Close read pipe descriptor failure");
+				exit(EXIT_FAILURE);
+			}
+			worker(pipe_descriptors[1],args); // create worker
 			break;
 		default:
-			printf("Hello from parent\n");
+			if(close(pipe_descriptors[1]) == -1)
+			{
+				perror("Close write pipe descriptor failure");
+				exit(EXIT_FAILURE);
+			}
+			connector(pipe_descriptors[0],args); // create connector
 	}
 }
+
+void worker(int write_descriptor, struct arguments* args)
+{
+	char buffer[BLOCK_SIZE];
+
+	
+
+	while(1)
+	{
+		for(int i=65; i<=122; i++)
+		{
+			if(i>90 && i < 97) continue;
+			memset(buffer,(char)i,BLOCK_SIZE*sizeof(char));
+			if(write(write_descriptor,&buffer,sizeof(char)*BLOCK_SIZE) == -1)
+			{
+				perror("Error while writing bytes");
+				exit(EXIT_FAILURE);
+			}
+			//sleep(1);
+		}
+	}
+
+}
+
+
+void connector(int read_descriptor, struct arguments* args)
+{
+	char buffer[PORTION];
+	for(int i=0; i<52;i++)
+	{
+		//sleep(2);
+		if(read(read_descriptor,&buffer,sizeof(char)*PORTION) == -1)
+		{
+			perror("Error while reading bytes");
+			exit(EXIT_FAILURE);
+		}
+		int size;
+		ioctl(read_descriptor,FIONREAD,&size);
+		printf("%s\n",buffer);
+		printf("DUUUUUUUUUUUUUUUUUUUUUUUUPA - %d %d\n",i,size);
+	}
+}
+
 
 
 void read_input(int argc, char* argv[],struct arguments* args)

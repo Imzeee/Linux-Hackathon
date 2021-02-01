@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <time.h>
 
 #define UNIT 2662
 #define BLOCK_SIZE 640
@@ -71,8 +72,15 @@ void create_warehouse(struct arguments* args)
 void worker(int write_descriptor, struct arguments* args)
 {
 	char buffer[BLOCK_SIZE];
+	float time = BLOCK_SIZE/(args->rate*UNIT);
+	double t2 = (double)time;
 
-	
+	int sec = (int)time;
+	int nan = (int)((time - (float)sec)*1000000000);
+	printf("TIMES:%d sec %d nano\n",sec,nan);
+	struct timespec SL = { .tv_sec = sec, .tv_nsec = nan };
+	printf("Time:%f\n",time);
+	printf("Time2:%lf\n",t2);
 
 	while(1)
 	{
@@ -80,12 +88,12 @@ void worker(int write_descriptor, struct arguments* args)
 		{
 			if(i>90 && i < 97) continue;
 			memset(buffer,(char)i,BLOCK_SIZE*sizeof(char));
+			nanosleep(&SL,NULL);
 			if(write(write_descriptor,&buffer,sizeof(char)*BLOCK_SIZE) == -1)
 			{
 				perror("Error while writing bytes");
 				exit(EXIT_FAILURE);
 			}
-			//sleep(1);
 		}
 	}
 
@@ -95,18 +103,28 @@ void worker(int write_descriptor, struct arguments* args)
 void connector(int read_descriptor, struct arguments* args)
 {
 	char buffer[PORTION];
-	for(int i=0; i<52;i++)
+	int current_size;
+	struct timespec delay = { .tv_sec = 0, .tv_nsec = 100 };
+	while(1)
 	{
-		//sleep(2);
+		if(ioctl(read_descriptor,FIONREAD,&current_size) == -1)
+		{
+			perror("Error in ioctl");
+			exit(EXIT_FAILURE);
+		}
+		if(current_size <= PORTION)
+		{
+			nanosleep(&delay,NULL);
+			continue;
+		}
 		if(read(read_descriptor,&buffer,sizeof(char)*PORTION) == -1)
 		{
 			perror("Error while reading bytes");
 			exit(EXIT_FAILURE);
 		}
-		int size;
-		ioctl(read_descriptor,FIONREAD,&size);
+
 		printf("%s\n",buffer);
-		printf("DUUUUUUUUUUUUUUUUUUUUUUUUPA - %d %d\n",i,size);
+
 	}
 }
 

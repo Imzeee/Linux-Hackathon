@@ -13,6 +13,10 @@
 #include <netdb.h>
 
 #define PORTION 13*1024
+#define PACKET 4*1024
+#define CONSUMPTION_UNIT 4435
+#define DEGRADATION_UNIT 819
+#define BIG_BLOCKS 30*1024
 
 
 struct arguments{
@@ -23,35 +27,69 @@ struct arguments{
 	unsigned int port;
 };
 
+long int Processed = 0;
+long int Downgraded = 0;
+
 void read_input(int argc, char* argv[],struct arguments* args);
 float parse_rate(void);
 int parse_capacity(void);
 void parse_location(char* location, struct arguments* args);
 
-void receive_data(int socket);
+int connecting(struct arguments* args);
+
+void receive_packet_of_data(int socket,struct arguments* args);
+float processing(int bytes,float consumption_rate);
+void downgrading(float processing_time, float degradation_rate);
+int is_free_space(long int capacity); // 1->true
 
 
 int main(int argc, char *argv[])
 {
 	struct arguments args = {};
-	read_input(argc,argv,&args);
-	printf("consumption_rate: %f\n",args.consumption_rate);
-	printf("degradation_rate: %f\n",args.degradation_rate);
-	printf("capacity: %d\n",args.capacity);
-	printf("address: %s\n",args.host);
-	printf("port: %u\n",args.port);
+	read_input(argc, argv, &args);
+	long int warehouse_capacity = (args.capacity) * BIG_BLOCKS;
+	printf("consumption_rate: %f\n", args.consumption_rate);
+	printf("degradation_rate: %f\n", args.degradation_rate);
+	printf("capacity: %d\n", args.capacity);
+	printf("address: %s\n", args.host);
+	printf("port: %u\n", args.port);
+
 
 	int socket_fd;
+	while ( 1 ) {
+		if ( is_free_space(warehouse_capacity))
+		{
+			printf("There is free space in warehouse %ld\n", warehouse_capacity);
+			socket_fd = connecting(&args);
+			receive_packet_of_data(socket_fd, &args);
+			if ( shutdown(socket_fd, SHUT_RDWR))
+			{
+				perror("");
+				exit(2);
+			}
+			printf("Shutting down socket\n");
+		} else {
+			printf("There is no space in warehouse\n");
+			return 0;
+		}
+
+	}
+}
+
+int connecting(struct arguments* args)
+{
+	int socket_fd;
 	struct sockaddr_in their_addr;
-	if ((socket_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+	if ((socket_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
+	{
 		perror("socket");
 		exit(1);
 	}
 	their_addr.sin_family = AF_INET;
-	their_addr.sin_port = htons(args.port);
-	int R = inet_aton(args.host,&their_addr.sin_addr);
+	their_addr.sin_port = htons(args->port);
+	int R = inet_aton(args->host,&their_addr.sin_addr);
 	if( ! R ) {
-		fprintf(stderr,"niepoprawny adres: %s\n",args.host);
+		fprintf(stderr,"niepoprawny adres: %s\n",args->host);
 		exit(1);
 	}
 
@@ -59,27 +97,79 @@ int main(int argc, char *argv[])
 		perror("connect");
 		exit(1);
 	}
-
-	receive_data(socket_fd);
-
-	if( shutdown(socket_fd,SHUT_RDWR) ) {
-		perror("");
-		exit(2);
-	}
-
-	return 0;
+	printf("Connected\n");
+	return socket_fd;
 }
 
 
-void receive_data(int socket)
+void receive_packet_of_data(int socket,struct arguments* args)
 {
-	char buffer[PORTION];
-	if(read(socket,buffer,sizeof(char)*PORTION) == -1)
+	char buffer[PACKET];
+
+	int bytes_read = read(socket,buffer,sizeof(char)*PACKET);
+	if(bytes_read == -1)
 	{
 		perror("Error while reading bytes from producer\n");
 		exit(EXIT_FAILURE);
 	}
-	printf("\n%s\n",buffer);
+	printf("Bytes read: %d\n",bytes_read);
+	printf("Received packet: %s\n",buffer);
+	processing(bytes_read,args->consumption_rate);
+	Processed += bytes_read;
+	printf("Processed: %ld\n",Processed);
+	printf("Downgraded: %ld\n",Downgraded);
+
+	for(int i = 0; i < 3; i++)
+	{
+		bytes_read = read(socket,buffer,sizeof(char)*PACKET);
+		if(bytes_read == -1)
+		{
+			perror("Error while reading bytes from producer\n");
+			exit(EXIT_FAILURE);
+		}
+		printf("Bytes read: %d\n",bytes_read);
+		printf("Received packet: %s\n",buffer);
+
+		printf("Bytes read: %d\n",bytes_read);
+		printf("Received packet: %s\n",buffer);
+
+		float processing_time = processing(bytes_read,args->consumption_rate);
+		Processed += bytes_read;
+		downgrading(processing_time,args->degradation_rate);
+
+		printf("Processed: %ld\n",Processed);
+		printf("Downgraded: %ld\n",Downgraded);
+	}
+
+
+}
+
+float processing(int bytes,float consumption_rate)
+{
+	float processing_time = (float)bytes/(consumption_rate*CONSUMPTION_UNIT); // accuracy to micro seconds
+	int sec = (int)processing_time;
+	int micro = (int)((processing_time - (float)sec)*1000000);
+	int nano = micro*1000;
+	struct timespec processing = { .tv_sec = sec, .tv_nsec = nano };
+	printf("Processing time: %d %d\n",sec,nano);
+	nanosleep(&processing,NULL);
+	return processing_time;
+
+}
+
+void downgrading(float processing_time, float degradation_rate)
+{
+	long int downgrade_bytes = (long int)(processing_time * degradation_rate * DEGRADATION_UNIT);
+	Downgraded += downgrade_bytes;
+}
+
+
+int is_free_space(long int capacity)
+{
+	long int occupied_space = Processed - Downgraded;
+	long int free_space = capacity - occupied_space;
+	if(free_space >= PORTION) return 1;
+	return 0;
 }
 
 void read_input(int argc, char* argv[],struct arguments* args)

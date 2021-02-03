@@ -10,11 +10,13 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <signal.h>
 
 
 #define UNIT 2662
 #define BLOCK_SIZE 640
 #define PORTION 13*1024
+#define PACKET 4*1024
 
 #define BACKLOG 200
 
@@ -34,12 +36,15 @@ void connector(int read_descriptor, struct arguments* args);
 
 void warehouseman(int socket, int read_descriptor);
 
-void rejestracja( int sockfd, char * Host, in_port_t Port );
-int polaczenie( int sockfd );
+void registering( int sockfd, char * Host, in_port_t Port );
+int connecting( int sockfd );
+void handler( int sig, siginfo_t * info, void * data );
+void disconnect_handler( void );
 
 int main(int argc, char* argv[])
 {
 	struct arguments args = {};
+	disconnect_handler();
 	read_input(argc,argv,&args);
 	printf("rate: %f\n",args.rate);
 	printf("address: %s\n",args.host);
@@ -120,7 +125,7 @@ void connector(int read_descriptor, struct arguments* args)
 		exit(EXIT_FAILURE);
 	}
 
-	rejestracja(sockfd,args->host,args->port);
+	registering(sockfd,args->host,args->port);
 
 	if (listen(sockfd, BACKLOG) == -1)
 	{
@@ -128,28 +133,26 @@ void connector(int read_descriptor, struct arguments* args)
 		exit(EXIT_FAILURE);
 	}
 
-	new_fd = polaczenie(sockfd);
-
-	if(new_fd == -1)
+	while(1)
 	{
-		perror("Connection failed\n");
-		exit(EXIT_FAILURE);
+		printf("Making new connection\n");
+		new_fd = connecting(sockfd);
+
+		if(new_fd == -1)
+		{
+			perror("Connection failed\n");
+			exit(EXIT_FAILURE);
+		}
+
+		warehouseman(new_fd,read_descriptor);
+
+		if( shutdown(new_fd,SHUT_RDWR) )
+		{
+			perror("");
+			exit(2);
+		}
+
 	}
-
-	warehouseman(new_fd,read_descriptor);
-
-	if( shutdown(new_fd,SHUT_RDWR) )
-	{
-		perror("");
-		exit(2);
-	}
-
-	if( shutdown(sockfd,SHUT_RDWR) )
-	{
-		perror("");
-		exit(2);
-	}
-
 
 }
 
@@ -158,44 +161,63 @@ void warehouseman(int socket, int read_descriptor)
 	char buffer[PORTION];
 	int current_size;
 	struct timespec delay = { .tv_sec = 0, .tv_nsec = 100 };
+	char chunks[3][PACKET];
+	char small_packet[1024];
 	while(1)
 	{
-		if(ioctl(read_descriptor,FIONREAD,&current_size) == -1)
+		if ( ioctl(read_descriptor, FIONREAD, &current_size) == -1 )
 		{
 			perror("Error in ioctl");
 			exit(EXIT_FAILURE);
 		}
-		if(current_size <= PORTION)
+		if ( current_size < PORTION )
 		{
-			nanosleep(&delay,NULL);
+			nanosleep(&delay, NULL);
 			continue;
 		}
-		int status;
-		status = read(read_descriptor,&buffer,sizeof(char)*PORTION);
-		if(status == -1)
-		{
-			perror("Error while reading bytes");
-			exit(EXIT_FAILURE);
-		} else{
-			printf("\nConnector read: %d bytes\n",status);
-		}
+		break;
+	}
+
+	int bytes;
+	bytes = read(read_descriptor,&buffer,sizeof(char)*PORTION);
+	if(bytes == -1)
+	{
+		perror("Error while reading bytes");
+		exit(EXIT_FAILURE);
+	} else{
+		printf("\nwarehouseman read: %d bytes\n",bytes);
+	}
+
+	for(int i=0; i<3;i++)
+	{
+		strncpy(chunks[i],buffer+(i*PACKET),PACKET);
+	}
+	strncpy(small_packet,buffer+PACKET+PACKET+PACKET,1024);
+
+	printf("%s\n",buffer);
 
 
-		printf("%s\n",buffer);
-		if(write(socket,buffer,sizeof(char)*PORTION) == -1)
+	for(int i=0; i<3;i++)
+	{
+		if(write(socket,chunks[i],sizeof(char)*PACKET) == -1)
 		{
 			perror("Error while writing bytes to socket");
 			exit(EXIT_FAILURE);
 		}
-
 	}
+	if(write(socket,small_packet,sizeof(char)*1024) == -1)
+	{
+		perror("Error while writing bytes to socket");
+		exit(EXIT_FAILURE);
+	}
+
 }
 
 
 
-void rejestracja( int sockfd, char* Host, in_port_t Port )
-{
 
+void registering( int sockfd, char* Host, in_port_t Port )
+{
 	struct sockaddr_in my_address;
 	my_address.sin_family = AF_INET;
 	my_address.sin_port = htons(Port);
@@ -213,7 +235,28 @@ void rejestracja( int sockfd, char* Host, in_port_t Port )
 	}
 }
 
-int polaczenie( int sockfd )
+
+void handler( int sig, siginfo_t * info, void * data )
+{
+	if ( info->si_signo == SIGPIPE )
+	{
+		printf("\nClient disconnected\n");
+	}
+}
+void disconnect_handler( void )
+{
+	struct sigaction sa;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = SA_SIGINFO;
+	sa.sa_sigaction = handler;
+	if( sigaction(SIGPIPE,&sa,NULL)==-1 )
+	{
+		perror("sigaction");
+		exit(EXIT_FAILURE);
+	}
+}
+
+int connecting( int sockfd )
 {
 	struct sockaddr_in peer;
 	socklen_t addr_len = sizeof(peer);

@@ -32,6 +32,8 @@ void create_warehouse(struct arguments* args);
 void worker(int write_descriptor, struct arguments* args);
 void connector(int read_descriptor, struct arguments* args);
 
+void warehouseman(int socket, int read_descriptor);
+
 void rejestracja( int sockfd, char * Host, in_port_t Port );
 int polaczenie( int sockfd );
 
@@ -83,9 +85,11 @@ void worker(int write_descriptor, struct arguments* args)
 	char buffer[BLOCK_SIZE];
 	float prod_time = BLOCK_SIZE/(args->rate*UNIT); // accuracy to micro seconds
 	int sec = (int)prod_time;
-	int micro = (int)((prod_time - sec)*1000000);
+	int micro = (int)((prod_time - (float)sec)*1000000);
 	int nano = micro*1000;
 	struct timespec production_time = { .tv_sec = sec, .tv_nsec = nano };
+
+	printf("%d %d\n",sec,nano);
 
 	while(1)
 	{
@@ -108,16 +112,12 @@ void worker(int write_descriptor, struct arguments* args)
 
 void connector(int read_descriptor, struct arguments* args)
 {
-	char buffer[PORTION];
-	int current_size;
-	struct timespec delay = { .tv_sec = 0, .tv_nsec = 100 };
-	//configure socket
-
 	int sockfd, new_fd;
 
-	if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+	if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
+	{
 		perror("socket");
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 
 	rejestracja(sockfd,args->host,args->port);
@@ -125,29 +125,39 @@ void connector(int read_descriptor, struct arguments* args)
 	if (listen(sockfd, BACKLOG) == -1)
 	{
 		perror("listen");
-		exit(1);
-	}
-	new_fd = polaczenie(sockfd);
-	if(new_fd == -1)
-	{
-		perror("Nie udalo sie nawiazac polaczenia\n");
 		exit(EXIT_FAILURE);
 	}
 
-	if (send(new_fd, "Hello, world!\n", 14, 0) == -1) perror("send");
+	new_fd = polaczenie(sockfd);
 
-	if( shutdown(new_fd,SHUT_RDWR) ) {
+	if(new_fd == -1)
+	{
+		perror("Connection failed\n");
+		exit(EXIT_FAILURE);
+	}
+
+	warehouseman(new_fd,read_descriptor);
+
+	if( shutdown(new_fd,SHUT_RDWR) )
+	{
 		perror("");
 		exit(2);
 	}
 
-	if( shutdown(sockfd,SHUT_RDWR) ) {
+	if( shutdown(sockfd,SHUT_RDWR) )
+	{
 		perror("");
 		exit(2);
 	}
 
-	//---------
 
+}
+
+void warehouseman(int socket, int read_descriptor)
+{
+	char buffer[PORTION];
+	int current_size;
+	struct timespec delay = { .tv_sec = 0, .tv_nsec = 100 };
 	while(1)
 	{
 		if(ioctl(read_descriptor,FIONREAD,&current_size) == -1)
@@ -170,14 +180,17 @@ void connector(int read_descriptor, struct arguments* args)
 			printf("\nConnector read: %d bytes\n",status);
 		}
 
-		//send data to client
 
 		printf("%s\n",buffer);
+		if(write(socket,buffer,sizeof(char)*PORTION) == -1)
+		{
+			perror("Error while writing bytes to socket");
+			exit(EXIT_FAILURE);
+		}
 
 	}
-
-
 }
+
 
 
 void rejestracja( int sockfd, char* Host, in_port_t Port )

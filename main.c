@@ -7,14 +7,20 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <time.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+
 
 #define UNIT 2662
 #define BLOCK_SIZE 640
 #define PORTION 13*1024
 
+#define BACKLOG 200
+
 struct arguments{
 	float rate;
-	char* address;
+	char* host;
 	unsigned int port;
 };
 
@@ -26,12 +32,15 @@ void create_warehouse(struct arguments* args);
 void worker(int write_descriptor, struct arguments* args);
 void connector(int read_descriptor, struct arguments* args);
 
+void rejestracja( int sockfd, char * Host, in_port_t Port );
+int polaczenie( int sockfd );
+
 int main(int argc, char* argv[])
 {
 	struct arguments args = {};
 	read_input(argc,argv,&args);
 	printf("rate: %f\n",args.rate);
-	printf("address: %s\n",args.address);
+	printf("address: %s\n",args.host);
 	printf("port: %u\n",args.port);
 	create_warehouse(&args);
 	return 0;
@@ -72,15 +81,11 @@ void create_warehouse(struct arguments* args)
 void worker(int write_descriptor, struct arguments* args)
 {
 	char buffer[BLOCK_SIZE];
-	float time = BLOCK_SIZE/(args->rate*UNIT);
-	double t2 = (double)time;
-
-	int sec = (int)time;
-	int nan = (int)((time - (float)sec)*1000000000);
-	printf("TIMES:%d sec %d nano\n",sec,nan);
-	struct timespec SL = { .tv_sec = sec, .tv_nsec = nan };
-	printf("Time:%f\n",time);
-	printf("Time2:%lf\n",t2);
+	float prod_time = BLOCK_SIZE/(args->rate*UNIT); // accuracy to micro seconds
+	int sec = (int)prod_time;
+	int micro = (int)((prod_time - sec)*1000000);
+	int nano = micro*1000;
+	struct timespec production_time = { .tv_sec = sec, .tv_nsec = nano };
 
 	while(1)
 	{
@@ -88,7 +93,8 @@ void worker(int write_descriptor, struct arguments* args)
 		{
 			if(i>90 && i < 97) continue;
 			memset(buffer,(char)i,BLOCK_SIZE*sizeof(char));
-			nanosleep(&SL,NULL);
+			nanosleep(&production_time,NULL);
+
 			if(write(write_descriptor,&buffer,sizeof(char)*BLOCK_SIZE) == -1)
 			{
 				perror("Error while writing bytes");
@@ -105,6 +111,43 @@ void connector(int read_descriptor, struct arguments* args)
 	char buffer[PORTION];
 	int current_size;
 	struct timespec delay = { .tv_sec = 0, .tv_nsec = 100 };
+	//configure socket
+
+	int sockfd, new_fd;
+
+	if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+		perror("socket");
+		exit(1);
+	}
+
+	rejestracja(sockfd,args->host,args->port);
+
+	if (listen(sockfd, BACKLOG) == -1)
+	{
+		perror("listen");
+		exit(1);
+	}
+	new_fd = polaczenie(sockfd);
+	if(new_fd == -1)
+	{
+		perror("Nie udalo sie nawiazac polaczenia\n");
+		exit(EXIT_FAILURE);
+	}
+
+	if (send(new_fd, "Hello, world!\n", 14, 0) == -1) perror("send");
+
+	if( shutdown(new_fd,SHUT_RDWR) ) {
+		perror("");
+		exit(2);
+	}
+
+	if( shutdown(sockfd,SHUT_RDWR) ) {
+		perror("");
+		exit(2);
+	}
+
+	//---------
+
 	while(1)
 	{
 		if(ioctl(read_descriptor,FIONREAD,&current_size) == -1)
@@ -117,24 +160,66 @@ void connector(int read_descriptor, struct arguments* args)
 			nanosleep(&delay,NULL);
 			continue;
 		}
-		if(read(read_descriptor,&buffer,sizeof(char)*PORTION) == -1)
+		int status;
+		status = read(read_descriptor,&buffer,sizeof(char)*PORTION);
+		if(status == -1)
 		{
 			perror("Error while reading bytes");
 			exit(EXIT_FAILURE);
+		} else{
+			printf("\nConnector read: %d bytes\n",status);
 		}
+
+		//send data to client
 
 		printf("%s\n",buffer);
 
 	}
+
+
 }
 
+
+void rejestracja( int sockfd, char* Host, in_port_t Port )
+{
+
+	struct sockaddr_in my_address;
+	my_address.sin_family = AF_INET;
+	my_address.sin_port = htons(Port);
+
+	int R = inet_aton(Host,&my_address.sin_addr);
+	if( ! R ) {
+		fprintf(stderr,"niepoprawny adres: %s\n",Host);
+		exit(1);
+	}
+
+	if( bind(sockfd,(struct sockaddr *)&my_address,sizeof(my_address)) )
+	{
+		perror("Bind socket");
+		exit(EXIT_FAILURE);
+	}
+}
+
+int polaczenie( int sockfd )
+{
+	struct sockaddr_in peer;
+	socklen_t addr_len = sizeof(peer);
+
+	int new_socket = accept(sockfd,(struct sockaddr *)&peer,&addr_len);
+	if( new_socket == -1 ) {
+		perror("");
+	} else {
+		printf("Connected with client\n");
+	}
+	return new_socket;
+}
 
 
 void read_input(int argc, char* argv[],struct arguments* args)
 {
-	if(argc != 4)
+	if(argc < 3 || argc > 4)
 	{
-		fprintf(stderr, "Incorrect number of parameters");
+		fprintf(stderr, "Incorrect number of parameters\n");
 		fprintf(stderr, "Usage: %s -p <float> [<addr:>]port \n", argv[0]);
 		exit(EXIT_FAILURE);
 	}
@@ -164,6 +249,7 @@ void read_input(int argc, char* argv[],struct arguments* args)
 		}
 	}
 
+
 	if(optind != argc-1)
 	{
 		fprintf(stderr, "Expected argument after options\n");
@@ -181,7 +267,7 @@ float parse_rate(void)
 	float rate = strtof(optarg, &endptr);
 	if( errno != 0 || *endptr != '\0')
 	{
-		perror("Incorrect parameter in -p option ");
+		perror("Incorrect parameter in -p option \n");
 		exit(EXIT_FAILURE);
 	}
 	return rate;
@@ -216,10 +302,10 @@ void parse_location(char* location, struct arguments* args)
 			perror("Incorrect location port\n");
 			exit(EXIT_FAILURE);
 		}
-		args->address = first_part;
+		args->host = first_part;
 
 	} else{
-		args->address = "localhost";
+		args->host = "127.0.0.1";
 	}
 	args->port = port;
 }

@@ -12,19 +12,29 @@
 #include <arpa/inet.h>
 #include <signal.h>
 
+#include <sys/poll.h>
+#include <netinet/in.h>
+
+#include<sys/epoll.h>
+
+
+
 
 #define UNIT 2662
 #define BLOCK_SIZE 640
 #define PORTION 13*1024
 #define PACKET 4*1024
 
-#define BACKLOG 200
+#define MAX_CLIENTS 200
+#define BACKLOG 32
 
 struct arguments{
 	float rate;
 	char* host;
 	unsigned int port;
 };
+
+
 
 void read_input(int argc, char* argv[],struct arguments* args);
 float parse_rate(void);
@@ -34,7 +44,7 @@ void create_warehouse(struct arguments* args);
 void worker(int write_descriptor, struct arguments* args);
 void connector(int read_descriptor, struct arguments* args);
 
-void warehouseman(int socket, int read_descriptor);
+int warehouseman(int socket, int read_descriptor);
 
 void registering( int sockfd, char * Host, in_port_t Port );
 int connecting( int sockfd );
@@ -117,13 +127,31 @@ void worker(int write_descriptor, struct arguments* args)
 
 void connector(int read_descriptor, struct arguments* args)
 {
+	struct pollfd fds[MAX_CLIENTS];
 	int sockfd, new_fd;
-
 	if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
 	{
 		perror("socket");
 		exit(EXIT_FAILURE);
 	}
+
+	int on = 1;
+	int status = setsockopt(sockfd, SOL_SOCKET,  SO_REUSEADDR,(char *)&on, sizeof(on)); //Allow socket descriptor to be reuseable
+	if (status < 0)
+	{
+		perror("setsockopt() failed");
+		close(sockfd);
+		exit(-1);
+	}
+
+	status = ioctl(sockfd, FIONBIO, (char *)&on); //Set socket to be nonblocking
+	if (status < 0)
+	{
+		perror("ioctl() failed");
+		close(sockfd);
+		exit(-1);
+	}
+
 
 	registering(sockfd,args->host,args->port);
 
@@ -133,31 +161,115 @@ void connector(int read_descriptor, struct arguments* args)
 		exit(EXIT_FAILURE);
 	}
 
-	while(1)
-	{
-		printf("Making new connection\n");
-		new_fd = connecting(sockfd);
+	memset(fds, 0 , sizeof(fds));
 
-		if(new_fd == -1)
+	fds[0].fd = sockfd;
+	fds[0].events = POLLIN;
+	int timeout = (3 * 60 * 1000);
+	int end_server = 0;
+	int nfds = 1, current_size = 0;
+	int compress_array = 0;
+	int close_conn;
+	int len;
+
+	while(end_server == 0 )
+	{
+		printf("Waiting on poll()...\n");
+		status = poll(fds, nfds, timeout);
+		printf("Ended on poll()...\n");
+		if (status < 0)
 		{
-			perror("Connection failed\n");
-			exit(EXIT_FAILURE);
+			perror("Call to poll() failed\n");
+			break;
+		}
+		if (status == 0)
+		{
+			printf("Poll() timeout\n");
+			break;
 		}
 
-		warehouseman(new_fd,read_descriptor);
-
-		if( shutdown(new_fd,SHUT_RDWR) )
+		current_size = nfds;
+		printf("Starting loop over current_size\n");
+		for(int i=0; i<current_size; i++)
 		{
-			perror("");
-			exit(2);
+			if(fds[i].revents == 0) continue;
+			if(fds[i].revents != POLLIN && fds[i].revents != POLLOUT)
+			{
+				printf("Error in revents = %d\n", fds[i].revents);
+				end_server = 1;
+				break;
+			}
+			printf("Checkpoint #1\n");
+			if(fds[i].fd == sockfd )
+			{
+				printf("Listening socket is writable\n");
+				while(1)
+				{
+					printf("Checkpoint #2\n");
+					new_fd = accept(sockfd, NULL, NULL);
+					if (new_fd < 0)
+					{
+						if (errno != EWOULDBLOCK)
+						{
+							perror("  accept() failed");
+							end_server = 1;
+						}
+						break;
+					}
+					printf("  New incoming connection - %d\n", new_fd);
+					fds[nfds].fd = new_fd;
+					fds[nfds].events = POLLOUT;
+					nfds++;
+					printf("Checkpoint #3\n");
+				}
+			} else{
+				printf("Checkpoint #4\n");
+				printf("  Descriptor %d is readable\n", fds[i].fd);
+
+				int sent_bytes = warehouseman(fds[i].fd, read_descriptor);
+				printf("Bytes send (connector kiddos) %d\n", sent_bytes);
+				close(fds[i].fd);
+				printf("Connection closed (connector)\n");
+				fds[i].fd = -1;
+
+				compress_array = 1;
+				printf("Checkpoint #5\n");
+			}
+		}
+
+		if (compress_array)
+		{
+			printf("Checkpoint #6\n");
+			compress_array = 0;
+			for (int i = 0; i < nfds; i++)
+			{
+				if (fds[i].fd == -1)
+				{
+					for(int j = i; j < nfds; j++)
+					{
+						fds[j].fd = fds[j+1].fd;
+					}
+					i--;
+					nfds--;
+				}
+			}
+			printf("Checkpoint #7\n");
 		}
 
 	}
 
+
+	for (int i = 0; i < nfds; i++)
+	{
+		if(fds[i].fd >= 0) close(fds[i].fd);
+	}
+
+
 }
 
-void warehouseman(int socket, int read_descriptor)
+int warehouseman(int socket, int read_descriptor)
 {
+	int send_bytes = 0;
 	char buffer[PORTION];
 	int current_size;
 	struct timespec delay = { .tv_sec = 0, .tv_nsec = 100 };
@@ -202,14 +314,19 @@ void warehouseman(int socket, int read_descriptor)
 		if(write(socket,chunks[i],sizeof(char)*PACKET) == -1)
 		{
 			perror("Error while writing bytes to socket");
-			exit(EXIT_FAILURE);
+			return send_bytes;
 		}
+		printf("One packet written(warehouseman)\n");
+		send_bytes += PACKET;
 	}
 	if(write(socket,small_packet,sizeof(char)*1024) == -1)
 	{
 		perror("Error while writing bytes to socket");
-		exit(EXIT_FAILURE);
+		return send_bytes;
 	}
+	printf("One small packet written(warehouseman)\n");
+	send_bytes += 1024;
+	return send_bytes;
 
 }
 

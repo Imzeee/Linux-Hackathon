@@ -2,31 +2,28 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <sys/stat.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <time.h>
-#include <sys/types.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <signal.h>
-
 #include <sys/poll.h>
 #include <netinet/in.h>
-
-#include<sys/epoll.h>
-
-
+#include <sys/time.h>
+#include <limits.h>
 
 
 #define UNIT 2662
 #define BLOCK_SIZE 640
 #define PORTION 13*1024
 #define PACKET 4*1024
+#define KB 1024
 
 #define MAX_CLIENTS 200
 #define BACKLOG 32
+#define TIMEOUT 3 * 60 * 1000 //timeout on poll in miliseconds
 
 struct arguments{
 	float rate;
@@ -34,40 +31,61 @@ struct arguments{
 	unsigned int port;
 };
 
+int Current_clients = 0;
+int Pipe_descriptors[2]; //0 - READ, 1 - WRITE, made global to be able to generate warehouse report
+int Generated = 0;
+int Spend = 0;
 
 
-void read_input(int argc, char* argv[],struct arguments* args);
+void read_arguments(int argc, char* argv[],struct arguments* args);
 float parse_rate(void);
 void parse_location(char* location, struct arguments* args);
 
 void create_warehouse(struct arguments* args);
 void worker(int write_descriptor, struct arguments* args);
 void connector(int read_descriptor, struct arguments* args);
-
 int warehouseman(int socket, int read_descriptor);
 
 void registering( int sockfd, char * Host, in_port_t Port );
-int connecting( int sockfd );
+
 void handler( int sig, siginfo_t * info, void * data );
 void disconnect_handler( void );
+
+void set_timer();
+void handle_alarm( int sig, siginfo_t * info, void * data );
+void alarm_sig( void );
+
+void disconnect_report(struct sockaddr_in* peer, int wasted_bytes);
+
+
+
+/*
+	Przykladowe parametry dla ktorych uruchamialem programy ktore sie wykonaly :) :
+
+ 	./server-p 3.0 8888
+	Jednoczesnie w osobnych terminalach:
+ 	./client -c 1 -p 1 -d 1 8888
+	./client -c 2 -p 2 -d 2 8888
+	./client -c 3 -p 3 -d 1 8888
+	./client -c 2 -p 1 -d 1 8888
+ 	./client -c 2 -p 2 -d 1 8888
+
+ */
+
 
 int main(int argc, char* argv[])
 {
 	struct arguments args = {};
-	disconnect_handler();
-	read_input(argc,argv,&args);
-	printf("rate: %f\n",args.rate);
-	printf("address: %s\n",args.host);
-	printf("port: %u\n",args.port);
+	read_arguments(argc,argv,&args);
 	create_warehouse(&args);
 	return 0;
 }
 
 
+
 void create_warehouse(struct arguments* args)
 {
-	int pipe_descriptors[2]; //0 - READ, 1 - WRITE
-	if(pipe(pipe_descriptors) == -1)
+	if(pipe(Pipe_descriptors) == -1)
 	{
 		perror("Pipe creation failure\n");
 		exit(EXIT_FAILURE);
@@ -76,26 +94,30 @@ void create_warehouse(struct arguments* args)
 	switch (p) {
 		case -1:
 			perror("fork failure");
-			exit(2);
+			exit(EXIT_FAILURE);
 		case 0:
-			if(close(pipe_descriptors[0]) == -1)
+			if(close(Pipe_descriptors[0]) == -1)
 			{
 				perror("Close read pipe descriptor failure");
 				exit(EXIT_FAILURE);
 			}
-			worker(pipe_descriptors[1],args); // create worker
+			worker(Pipe_descriptors[1],args); // create worker
 			break;
 		default:
-			if(close(pipe_descriptors[1]) == -1)
+			if(close(Pipe_descriptors[1]) == -1)
 			{
 				perror("Close write pipe descriptor failure");
 				exit(EXIT_FAILURE);
 			}
-			connector(pipe_descriptors[0],args); // create connector
+			disconnect_handler(); // set signals handling only for parent
+			alarm_sig();
+			set_timer();
+
+			connector(Pipe_descriptors[0],args); // create connector
 	}
 }
 
-void worker(int write_descriptor, struct arguments* args)
+void worker(int write_descriptor, struct arguments* args) // produces bytes and stores them in warehouse
 {
 	char buffer[BLOCK_SIZE];
 	float prod_time = BLOCK_SIZE/(args->rate*UNIT); // accuracy to micro seconds
@@ -103,20 +125,26 @@ void worker(int write_descriptor, struct arguments* args)
 	int micro = (int)((prod_time - (float)sec)*1000000);
 	int nano = micro*1000;
 	struct timespec production_time = { .tv_sec = sec, .tv_nsec = nano };
-
-	printf("%d %d\n",sec,nano);
+	//printf("%d %d\n",sec,nano);
 
 	while(1)
 	{
 		for(int i=65; i<=122; i++)
 		{
 			if(i>90 && i < 97) continue;
-			memset(buffer,(char)i,BLOCK_SIZE*sizeof(char));
-			nanosleep(&production_time,NULL);
-
+			if(memset(buffer,(char)i,BLOCK_SIZE*sizeof(char)) == NULL)
+			{
+				perror("Memset error in worker\n");
+				exit(EXIT_FAILURE);
+			}
+			if(nanosleep(&production_time,NULL) == -1)
+			{
+				perror("Sleep in worker error\n");
+				exit(EXIT_FAILURE);
+			}
 			if(write(write_descriptor,&buffer,sizeof(char)*BLOCK_SIZE) == -1)
 			{
-				perror("Error while writing bytes");
+				perror("Error while writing bytes (worker)");
 				exit(EXIT_FAILURE);
 			}
 		}
@@ -125,35 +153,36 @@ void worker(int write_descriptor, struct arguments* args)
 }
 
 
-void connector(int read_descriptor, struct arguments* args)
+void connector(int read_descriptor, struct arguments* args) // handle connections
 {
-	struct pollfd fds[MAX_CLIENTS];
+	struct pollfd clients_descriptors[MAX_CLIENTS];
 	int sockfd, new_fd;
+	memset(clients_descriptors, 0 , sizeof(clients_descriptors));
+	int number_of_fds = 1;
+	int status, current_size;
+	struct sockaddr_in peer_addresses[MAX_CLIENTS];
+	errno=0;
+
+	sigset_t blockSet, prevMask;
+	if(sigemptyset(&blockSet) == -1)
+	{
+		perror("sigemptyset error\n");
+		exit(EXIT_FAILURE);
+	}
+
+	if(sigaddset(&blockSet, SIGALRM) == -1)
+	{
+		perror("sigaddset error\n");
+		exit(EXIT_FAILURE);
+	}
+
 	if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
 	{
 		perror("socket");
 		exit(EXIT_FAILURE);
 	}
 
-	int on = 1;
-	int status = setsockopt(sockfd, SOL_SOCKET,  SO_REUSEADDR,(char *)&on, sizeof(on)); //Allow socket descriptor to be reuseable
-	if (status < 0)
-	{
-		perror("setsockopt() failed");
-		close(sockfd);
-		exit(-1);
-	}
-
-	status = ioctl(sockfd, FIONBIO, (char *)&on); //Set socket to be nonblocking
-	if (status < 0)
-	{
-		perror("ioctl() failed");
-		close(sockfd);
-		exit(-1);
-	}
-
-
-	registering(sockfd,args->host,args->port);
+	registering(sockfd,args->host,args->port); // configure socket
 
 	if (listen(sockfd, BACKLOG) == -1)
 	{
@@ -161,132 +190,120 @@ void connector(int read_descriptor, struct arguments* args)
 		exit(EXIT_FAILURE);
 	}
 
-	memset(fds, 0 , sizeof(fds));
+	clients_descriptors[0].fd = sockfd;
+	clients_descriptors[0].events = POLLIN;
 
-	fds[0].fd = sockfd;
-	fds[0].events = POLLIN;
-	int timeout = (3 * 60 * 1000);
-	int end_server = 0;
-	int nfds = 1, current_size = 0;
-	int compress_array = 0;
-	int close_conn;
-	int len;
-
-	while(end_server == 0 )
+	while(1)
 	{
-		printf("Waiting on poll()...\n");
-		status = poll(fds, nfds, timeout);
-		printf("Ended on poll()...\n");
+		if (sigprocmask(SIG_BLOCK, &blockSet, &prevMask) == -1) // block poll being interrupted by SIGALRM (causes crash)
+		{
+			perror("sigprocmask error\n");
+			exit(EXIT_FAILURE);
+		}
+		printf("Listening...\n");
+		status = poll(clients_descriptors, number_of_fds, TIMEOUT);
+		if (sigprocmask(SIG_SETMASK, &prevMask, NULL) == -1) // unblock SIGALRM
+		{
+			perror("sigprocmask2 error\n");
+			exit(EXIT_FAILURE);
+		}
+
 		if (status < 0)
 		{
 			perror("Call to poll() failed\n");
-			break;
+			exit(EXIT_FAILURE);
 		}
 		if (status == 0)
 		{
 			printf("Poll() timeout\n");
-			break;
+			exit(EXIT_FAILURE);
 		}
 
-		current_size = nfds;
-		printf("Starting loop over current_size\n");
+		current_size = number_of_fds;
 		for(int i=0; i<current_size; i++)
 		{
-			if(fds[i].revents == 0) continue;
-			if(fds[i].revents != POLLIN && fds[i].revents != POLLOUT)
+			if(clients_descriptors[i].revents == 0) continue;
+			if(clients_descriptors[i].revents != POLLIN && clients_descriptors[i].revents != POLLOUT)
 			{
-				printf("Error in revents = %d\n", fds[i].revents);
-				end_server = 1;
-				break;
+				printf("Error in revents = %d\n", clients_descriptors[i].revents);
+				exit(EXIT_FAILURE);
 			}
-			printf("Checkpoint #1\n");
-			if(fds[i].fd == sockfd )
+			if(clients_descriptors[i].fd == sockfd )
 			{
-				printf("Listening socket is writable\n");
 				while(1)
 				{
-					printf("Checkpoint #2\n");
-					new_fd = accept(sockfd, NULL, NULL);
+					struct sockaddr_in peer;
+					socklen_t addr_len = sizeof(peer);
+
+					new_fd = accept(sockfd,(struct sockaddr *)&peer,&addr_len);
 					if (new_fd < 0)
 					{
 						if (errno != EWOULDBLOCK)
 						{
-							perror("  accept() failed");
-							end_server = 1;
+							perror("Accept failed\n");
+							exit(EXIT_FAILURE);
 						}
 						break;
 					}
-					printf("  New incoming connection - %d\n", new_fd);
-					fds[nfds].fd = new_fd;
-					fds[nfds].events = POLLOUT;
-					nfds++;
-					printf("Checkpoint #3\n");
+
+					Current_clients++;
+					printf("(New connection with client: %s (port %d))\n",
+							inet_ntoa(peer.sin_addr),ntohs(peer.sin_port));
+					clients_descriptors[number_of_fds].fd = new_fd;
+					peer_addresses[number_of_fds] = peer;
+					clients_descriptors[number_of_fds].events = POLLOUT;
+					number_of_fds++;
+
 				}
 			} else{
-				printf("Checkpoint #4\n");
-				printf("  Descriptor %d is readable\n", fds[i].fd);
 
-				int sent_bytes = warehouseman(fds[i].fd, read_descriptor);
-				printf("Bytes send (connector kiddos) %d\n", sent_bytes);
-				close(fds[i].fd);
-				printf("Connection closed (connector)\n");
-				fds[i].fd = -1;
+				int wasted_bytes = 0;
+				int sent_bytes = warehouseman(clients_descriptors[i].fd, read_descriptor);
+				printf("(Bytes sent to client: %d)\n", sent_bytes);
+				if(sent_bytes != PORTION) wasted_bytes = (PORTION - sent_bytes);
+				Spend+=sent_bytes;
 
-				compress_array = 1;
-				printf("Checkpoint #5\n");
-			}
-		}
-
-		if (compress_array)
-		{
-			printf("Checkpoint #6\n");
-			compress_array = 0;
-			for (int i = 0; i < nfds; i++)
-			{
-				if (fds[i].fd == -1)
+				if( shutdown(clients_descriptors[i].fd,SHUT_RDWR) == -1 ) // close connection after sending bytes
 				{
-					for(int j = i; j < nfds; j++)
-					{
-						fds[j].fd = fds[j+1].fd;
-					}
-					i--;
-					nfds--;
+					perror("Shutdown error");
+					exit(EXIT_FAILURE);
 				}
+
+				Current_clients--;
+
+				disconnect_report(&peer_addresses[i], wasted_bytes);
+
+				clients_descriptors[i].fd = -1;
+				number_of_fds--;
 			}
-			printf("Checkpoint #7\n");
 		}
 
 	}
-
-
-	for (int i = 0; i < nfds; i++)
-	{
-		if(fds[i].fd >= 0) close(fds[i].fd);
-	}
-
 
 }
 
-int warehouseman(int socket, int read_descriptor)
+int warehouseman(int socket, int read_descriptor) // waiting for portion and sending to client
 {
-	int send_bytes = 0;
+	int sent_bytes = 0;
+	errno=0;
 	char buffer[PORTION];
-	int current_size;
+	int current_occupied;
 	struct timespec delay = { .tv_sec = 0, .tv_nsec = 100 };
 	char chunks[3][PACKET];
 	char small_packet[1024];
 	while(1)
 	{
-		if ( ioctl(read_descriptor, FIONREAD, &current_size) == -1 )
+		if ( ioctl(read_descriptor, FIONREAD, &current_occupied) == -1 )
 		{
 			perror("Error in ioctl");
 			exit(EXIT_FAILURE);
 		}
-		if ( current_size < PORTION )
+		if ( current_occupied < PORTION )
 		{
 			nanosleep(&delay, NULL);
 			continue;
 		}
+		Generated += current_occupied;
 		break;
 	}
 
@@ -296,53 +313,76 @@ int warehouseman(int socket, int read_descriptor)
 	{
 		perror("Error while reading bytes");
 		exit(EXIT_FAILURE);
-	} else{
-		printf("\nwarehouseman read: %d bytes\n",bytes);
 	}
 
 	for(int i=0; i<3;i++)
 	{
-		strncpy(chunks[i],buffer+(i*PACKET),PACKET);
-	}
-	strncpy(small_packet,buffer+PACKET+PACKET+PACKET,1024);
-
-	printf("%s\n",buffer);
-
-
-	for(int i=0; i<3;i++)
-	{
-		if(write(socket,chunks[i],sizeof(char)*PACKET) == -1)
+		if(strncpy(chunks[i],buffer+(i*PACKET),PACKET) == NULL)
 		{
-			perror("Error while writing bytes to socket");
-			return send_bytes;
+			perror("strncpy error\n");
+			exit(EXIT_FAILURE);
 		}
-		printf("One packet written(warehouseman)\n");
-		send_bytes += PACKET;
 	}
-	if(write(socket,small_packet,sizeof(char)*1024) == -1)
+
+	if(strncpy(small_packet,buffer+(3*PACKET),KB) == NULL)
 	{
-		perror("Error while writing bytes to socket");
-		return send_bytes;
+		perror("strncpy error\n");
+		exit(EXIT_FAILURE);
 	}
-	printf("One small packet written(warehouseman)\n");
-	send_bytes += 1024;
-	return send_bytes;
+
+	int written;
+	for(int i=0; i<3;i++)
+	{
+		written = write(socket,chunks[i],sizeof(char)*PACKET);
+		if(written == -1)
+		{
+			printf("Sending bytes to client interrupted\n");
+			return sent_bytes;
+		}
+		sent_bytes += written;
+	}
+	written = write(socket,small_packet,sizeof(char)*KB);
+	if(written == -1)
+	{
+		printf("Sending bytes to client interrupted\n");
+		return sent_bytes;
+	}
+	sent_bytes += written;
+
+	return sent_bytes;
 
 }
 
 
-
-
-void registering( int sockfd, char* Host, in_port_t Port )
+void registering( int sockfd, char* Host, in_port_t Port ) // socket configuration
 {
+	int on = 1;
+	errno=0;
+	int status = setsockopt(sockfd, SOL_SOCKET,  SO_REUSEADDR,(char *)&on, sizeof(on)); //Allow socket descriptor to be reusable
+	if (status < 0)
+	{
+		perror("setsockopt failure\n");
+		close(sockfd);
+		exit(EXIT_FAILURE);
+	}
+
+	status = ioctl(sockfd, FIONBIO, (char *)&on); // Set socket to be nonblocking
+	if (status < 0)
+	{
+		perror("ioctl failure (registering)\n");
+		close(sockfd);
+		exit(EXIT_FAILURE);
+	}
+
 	struct sockaddr_in my_address;
 	my_address.sin_family = AF_INET;
 	my_address.sin_port = htons(Port);
 
-	int R = inet_aton(Host,&my_address.sin_addr);
-	if( ! R ) {
-		fprintf(stderr,"niepoprawny adres: %s\n",Host);
-		exit(1);
+	int check = inet_aton(Host,&my_address.sin_addr);
+	if(!check)
+	{
+		fprintf(stderr,"Incorrect address: %s\n",Host);
+		exit(EXIT_FAILURE);
 	}
 
 	if( bind(sockfd,(struct sockaddr *)&my_address,sizeof(my_address)) )
@@ -353,16 +393,19 @@ void registering( int sockfd, char* Host, in_port_t Port )
 }
 
 
-void handler( int sig, siginfo_t * info, void * data )
+
+void handler(int sig, siginfo_t* info, void* data)
 {
 	if ( info->si_signo == SIGPIPE )
 	{
 		printf("\nClient disconnected\n");
 	}
 }
-void disconnect_handler( void )
+
+void disconnect_handler(void)
 {
 	struct sigaction sa;
+	errno=0;
 	sigemptyset(&sa.sa_mask);
 	sa.sa_flags = SA_SIGINFO;
 	sa.sa_sigaction = handler;
@@ -373,22 +416,9 @@ void disconnect_handler( void )
 	}
 }
 
-int connecting( int sockfd )
-{
-	struct sockaddr_in peer;
-	socklen_t addr_len = sizeof(peer);
-
-	int new_socket = accept(sockfd,(struct sockaddr *)&peer,&addr_len);
-	if( new_socket == -1 ) {
-		perror("");
-	} else {
-		printf("Connected with client\n");
-	}
-	return new_socket;
-}
 
 
-void read_input(int argc, char* argv[],struct arguments* args)
+void read_arguments(int argc, char* argv[],struct arguments* args)
 {
 	if(argc < 3 || argc > 4)
 	{
@@ -398,6 +428,7 @@ void read_input(int argc, char* argv[],struct arguments* args)
 	}
 
 	opterr = 0;
+	errno=0;
 	int c;
 	while ((c = getopt (argc, argv, "p:")) != -1) {
 		switch ( c ) {
@@ -421,7 +452,6 @@ void read_input(int argc, char* argv[],struct arguments* args)
 				exit(EXIT_FAILURE);
 		}
 	}
-
 
 	if(optind != argc-1)
 	{
@@ -448,7 +478,6 @@ float parse_rate(void)
 
 void parse_location(char* location, struct arguments* args)
 {
-	printf("location: %s\n",location);
 	errno=0;
 	char* endptr = NULL;
 	unsigned int port = strtoul(location, &endptr,0);
@@ -481,4 +510,74 @@ void parse_location(char* location, struct arguments* args)
 		args->host = "127.0.0.1";
 	}
 	args->port = port;
+}
+
+void set_timer()
+{
+	errno=0;
+	struct timeval it_value = {.tv_sec = 5, .tv_usec = 0};
+	struct timeval it_interval = {.tv_sec = 5, .tv_usec = 0};
+	struct itimerval new_value ={.it_value = it_value, .it_interval = it_interval};
+	if(setitimer(ITIMER_REAL , &new_value ,NULL ) == -1)
+	{
+		perror("settimer");
+		exit(EXIT_FAILURE);
+	}
+}
+
+void handle_alarm( int sig, siginfo_t * info, void * data )
+{
+	struct timespec tp;
+	errno=0;
+
+	int time =  clock_gettime(CLOCK_REALTIME , &tp );
+	if(time == -1)
+	{
+		perror("Error in clock_gettime\n");
+		exit(EXIT_FAILURE);
+	}
+
+	int current_occupied;
+	if ( ioctl(Pipe_descriptors[0], FIONREAD, &current_occupied) == -1 )
+	{
+		perror("Error in ioctl");
+		exit(EXIT_FAILURE);
+	}
+	int pipe_capacity = 16*PIPE_BUF;
+	float procent = (float)current_occupied/(float)pipe_capacity;
+	procent*=100;
+
+	if ( info->si_signo == SIGALRM )
+	{
+		fprintf(stderr,"\n-----------\nINTERVAL REPORT:\n");
+		fprintf(stderr,"TS: %ld-sec %ld-nano\n",tp.tv_sec,tp.tv_nsec);
+		fprintf(stderr,"Number of accepted clients: %d\n",Current_clients);
+		fprintf(stderr,"Magazine: %dB/%dB (%d %c)\n",current_occupied,pipe_capacity,(int)procent,'%');
+		fprintf(stderr,"Flow: %dB(generated - spend)\n",Generated-Spend);
+		fprintf(stderr,"-----------\n");
+	}
+	Generated=0;
+	Spend=0;
+}
+void alarm_sig( void )
+{
+	struct sigaction sa;
+	errno=0;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = SA_SIGINFO;
+	sa.sa_sigaction = handle_alarm;
+	if( sigaction(SIGALRM,&sa,NULL)==-1 )
+	{
+		perror("sigaction");
+		exit(EXIT_FAILURE);
+	}
+}
+
+void disconnect_report(struct sockaddr_in* peer, int wasted)
+{
+	fprintf(stderr,"\n-----------\nDISCONNECT REPORT:\n");
+	fprintf(stderr,"Connection closed with client: %s (port %d)\n",
+			inet_ntoa(peer->sin_addr),ntohs(peer->sin_port));
+	fprintf(stderr,"Bytes wasted: %d\n",wasted);
+	fprintf(stderr,"-----------\n");
 }
